@@ -1,10 +1,6 @@
 import { Request, Response } from 'express';
-import pdf from 'pdf-parse';
+import { PDFParse } from 'pdf-parse'; // 1. Import the Class directly
 
-// Senior Trick: pdf-parse doesn't have official TS types. 
-// We declare it loosely so TypeScript doesn't complain.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const pdfParse = require('pdf-parse');
 
 export const uploadDocument = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -17,9 +13,10 @@ export const uploadDocument = async (req: Request, res: Response): Promise<void>
     }
 
     // 2. Extract text from the PDF buffer (in memory)
-    const pdfData = await pdfParse(req.file.buffer);
+    const parser = new PDFParse({data: req.file.buffer});
+   // 3. Call the getText() method
+    const pdfData = await parser.getText();
     const rawText = pdfData.text;
-
     // 3. Clean the text (remove extra newlines, spaces)
     const cleanedText = rawText.replace(/\s+/g, ' ').trim();
 
