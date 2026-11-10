@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",       // "Write the output in modern JavaScript"
+    "module": "NodeNext",     // "Use the modern Node.js module system (ES Modules)"
+    "moduleResolution": "NodeNext", 
+    "outDir": "./dist",       // "Put the compiled JavaScript in a 'dist' folder"
+    "rootDir": "./src",       // "Only look for code in the 'src' folder"
+    "strict": true,           // "Be super strict about types (catches the most bugs)"
+    "esModuleInterop": true   // "Allows us to use 'import express from "express"' instead of weird syntax"
+  },
+  "include": ["src/**/*"]     // "Only compile files inside the src folder"
+}
