@@ -1,35 +1,35 @@
 import { Request, Response } from 'express';
-import { PDFParse } from 'pdf-parse'; // 1. Import the Class directly
-
+import { PDFParse } from 'pdf-parse';
+import { processAndSaveChunks } from '../services/chunkingService.js';
 
 export const uploadDocument = async (req: Request, res: Response): Promise<void> => {
   try {
-    // 1. Check if a file was uploaded
-    // Senior Trick: TypeScript doesn't know what req.file is by default.
-    // Multer adds it, so we check if it exists.
     if (!req.file) {
-      res.status(400).json({ error: 'No file uploaded. Please upload a PDF.' });
+      res.status(400).json({ error: 'No file uploaded.' });
       return;
     }
 
-    // 2. Extract text from the PDF buffer (in memory)
-    const parser = new PDFParse({data: req.file.buffer});
-   // 3. Call the getText() method
+    const parser = new PDFParse({ data: req.file.buffer });
     const pdfData = await parser.getText();
-    const rawText = pdfData.text;
-    // 3. Clean the text (remove extra newlines, spaces)
-    const cleanedText = rawText.replace(/\s+/g, ' ').trim();
+    
+    // We mock a tenantId for now (we'll add real auth later)
+    const tenantId = "tenant_default_123";
 
-    // 4. Return the text to the user for now (We will save this to DB in Step 3)
+    // Process chunks
+    const result = await processAndSaveChunks(pdfData.text, req.file.originalname, {
+      tenantId: tenantId,
+      chunkSize: 1000,
+      chunkOverlap: 200,
+    });
+
     res.status(200).json({
       message: 'File processed successfully',
       fileName: req.file.originalname,
-      textLength: cleanedText.length,
-      preview: cleanedText.substring(0, 200) + '...', // Just show a preview
+      ...result, // Spreads sourceHash, totalChunks, insertedCount, etc.
     });
 
-  } catch (error) {
+  } catch (error: any) {
     console.error('Upload Error:', error);
-    res.status(500).json({ error: 'Failed to process the document.' });
+    res.status(500).json({ error: error.message || 'Failed to process the document.' });
   }
 };
