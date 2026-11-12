@@ -19,6 +19,8 @@ export interface IDocumentChunk extends Document {
   ingestedAt: Date;
   // embedding: number[];       // added in Step 4
   metadata?: Record<string, unknown>;
+  embedding?: number[];          // added in Step 4
+
 }
 
 const DocumentChunkSchema = new Schema<IDocumentChunk>(
@@ -47,6 +49,7 @@ const DocumentChunkSchema = new Schema<IDocumentChunk>(
     tenantId: { type: String, required: true, index: true },
     ingestedAt: { type: Date, default: () => new Date(), required: true },
     metadata: { type: Schema.Types.Mixed },
+    embedding: { type: [Number], required: false, select: false },  // added in Step 4
   },
   {
     timestamps: false,          // ingestedAt is explicit; avoid duplicate timestamp fields

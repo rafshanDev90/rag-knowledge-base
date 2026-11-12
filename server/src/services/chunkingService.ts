@@ -1,11 +1,11 @@
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
-import { encoding_for_model, TiktokenModel } from 'tiktoken';
+import { getEncoding } from 'js-tiktoken'; // FIXED: Using pure JS version
 import { DocumentChunk, IDocumentChunk, buildChunkId, hashText } from '../models/DocumentChunk.js';
+import { generateEmbeddings } from './embeddingService.js'; // Ensure this is imported
 
 export interface ChunkingOptions {
   chunkSize?: number;
   chunkOverlap?: number;
-  tokenModel?: TiktokenModel;
   tenantId: string;
   blockType?: 'prose' | 'equation' | 'table' | 'code';
   page?: number;
@@ -22,21 +22,16 @@ export interface IngestionResult {
 
 const DEFAULT_CHUNK_SIZE = 1000;
 const DEFAULT_OVERLAP = 200;
-const DEFAULT_TOKEN_MODEL: TiktokenModel = 'gpt-4';
 
-function countTokens(text: string, model: TiktokenModel): number {
-  const enc = encoding_for_model(model);
-  try {
-    return enc.encode(text).length;
-  } finally {
-    enc.free();
-  }
+// Initialize the tokenizer once globally
+const enc = getEncoding('cl100k_base');
+
+function countTokens(text: string): number {
+  return enc.encode(text).length;
 }
 
 /**
  * Normalize text before hashing and splitting.
- * Collapsing whitespace prevents trivial formatting differences from
- * producing different hashes for semantically identical content.
  */
 function normalizeText(raw: string): string {
   return raw.replace(/\s+/g, ' ').trim();
@@ -50,14 +45,13 @@ export async function processAndSaveChunks(
   const {
     chunkSize = DEFAULT_CHUNK_SIZE,
     chunkOverlap = DEFAULT_OVERLAP,
-    tokenModel = DEFAULT_TOKEN_MODEL,
     tenantId,
     blockType = 'prose',
     page,
     section,
   } = options;
 
-  // --- Error boundary: input validation before any database work ---
+  // --- Error boundary ---
   if (!rawText || rawText.trim().length === 0) {
     throw new Error('Cannot chunk empty document text.');
   }
@@ -71,7 +65,7 @@ export async function processAndSaveChunks(
   const normalized = normalizeText(rawText);
   const sourceHash = hashText(normalized);
 
-  // --- Idempotency check: skip re-chunking if this source already exists ---
+  // --- Idempotency check ---
   const existing = await DocumentChunk.exists({ sourceHash, tenantId });
   if (existing) {
     const count = await DocumentChunk.countDocuments({ sourceHash, tenantId });
@@ -88,7 +82,6 @@ export async function processAndSaveChunks(
   const splitter = new RecursiveCharacterTextSplitter({
     chunkSize,
     chunkOverlap,
-    // Prefer structural boundaries when present; fall back to sentence/word boundaries.
     separators: ['\n\n', '\n', '. ', ' ', ''],
   });
 
@@ -98,8 +91,13 @@ export async function processAndSaveChunks(
   }
 
   const totalChunks = documents.length;
+  const textChunks = documents.map((doc) => doc.pageContent);
 
-  // --- Build chunk documents with computed token counts and hashes ---
+  // --- NEW: Generate Vectors via Ollama ---
+  console.log(`🧠 Generating embeddings for ${totalChunks} chunks via Ollama...`);
+  const embeddings = await generateEmbeddings(textChunks);
+
+  // --- Build chunk documents ---
   const chunkDocs: Partial<IDocumentChunk>[] = documents.map((doc, index) => {
     const chunkText = doc.pageContent;
     const contentHash = hashText(chunkText);
@@ -111,62 +109,37 @@ export async function processAndSaveChunks(
       chunkIndex: index,
       totalChunks,
       text: chunkText,
-      tokenCount: countTokens(chunkText, tokenModel),
+      tokenCount: countTokens(chunkText),
       blockType,
       page,
       section,
       tenantId,
       ingestedAt: new Date(),
+      embedding: embeddings[index], // NEW: Attach the 768-dimensional vector!
     };
   });
 
-  // --- Batch persistence with non-ordered writes ---
-  // ordered:false means duplicate-key or validation failures on one chunk
-  // do not abort the rest of the batch.
-  const result = await DocumentChunk.insertMany(chunkDocs, {
-    ordered: false,
-    lean: true,
-  });
-
-  // Mongo insertMany with ordered:false may throw a BulkWriteError
-  // containing successful insertions and per-document errors.
-  // We catch and normalize that into a result object.
-  return {
-    sourceHash,
-    totalChunks,
-    insertedCount: Array.isArray(result) ? result.length : totalChunks,
-    duplicateCount: 0,
-    writeErrors: [],
-  };
-}
-
-/**
- * Wrapper that normalizes BulkWriteError so callers get a consistent result.
- * Use this in the controller instead of calling processAndSaveChunks directly
- * if you want partial-success visibility.
- */
-export async function processAndSaveChunksSafe(
-  rawText: string,
-  fileName: string,
-  options: ChunkingOptions
-): Promise<IngestionResult> {
+  // --- Batch persistence ---
   try {
-    return await processAndSaveChunks(rawText, fileName, options);
-  } catch (error: unknown) {
-    const bulkError = error as {
-      insertedDocs?: unknown[];
-      result?: { insertedCount?: number };
-      writeErrors?: unknown[];
-      code?: number;
+    const result = await DocumentChunk.insertMany(chunkDocs, {
+      ordered: false,
+    });
+    return {
+      sourceHash,
+      totalChunks,
+      insertedCount: result.length,
+      duplicateCount: 0,
+      writeErrors: [],
     };
-
-    if (bulkError.code === 11000 || bulkError.writeErrors) {
+  } catch (error: any) {
+    // Handle BulkWriteError (duplicate keys)
+    if (error.code === 11000 || error.writeErrors) {
       return {
-        sourceHash: hashText(normalizeText(rawText)),
-        totalChunks: 0,
-        insertedCount: bulkError.result?.insertedCount ?? 0,
-        duplicateCount: bulkError.writeErrors?.length ?? 0,
-        writeErrors: bulkError.writeErrors ?? [],
+        sourceHash,
+        totalChunks,
+        insertedCount: error.result?.insertedCount || 0,
+        duplicateCount: error.writeErrors?.length || 0,
+        writeErrors: error.writeErrors || [],
       };
     }
     throw error;
