@@ -14,10 +14,8 @@ export const chatWithDocument = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    // 1. Embed the user's question
     const queryEmbedding = (await generateEmbeddings([query]))[0];
 
-    // 2. Retrieve the top 3 most relevant chunks from MongoDB
     const results = await DocumentChunk.aggregate([
       {
         $vectorSearch: {
@@ -26,37 +24,46 @@ export const chatWithDocument = async (req: Request, res: Response): Promise<voi
           queryVector: queryEmbedding,
           numCandidates: 100,
           limit: 3,
-          filter: { tenantId: tenantId }, // Keep tenant isolation
+          filter: { tenantId: tenantId },
         },
       },
       {
-        $project: { text: 1, sourceFile: 1, chunkIndex: 1 },
+        $project: { 
+          text: 1, 
+          sourceFile: 1, 
+          chunkIndex: 1,
+          score: { $meta: 'vectorSearchScore' } // Get the score
+        },
       },
     ]);
 
-    if (results.length === 0) {
-      res.status(404).json({ error: 'No relevant context found for this query.' });
+    // UPGRADE 1: Filter out low-quality matches (Score threshold)
+    const validResults = results.filter((r: any) => r.score > 0.70);
+
+    if (validResults.length === 0) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.write(`data: ${JSON.stringify({ token: "I'm sorry, I couldn't find relevant information in the provided documents to answer that." })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
       return;
     }
 
-    // 3. Build the Context Block
-    const context = results
+    const context = validResults
       .map((r: any) => `[Source: ${r.sourceFile}, Chunk ${r.chunkIndex}]\n${r.text}`)
       .join('\n\n');
 
-    // 4. Construct the Prompt (The "Injection" phase)
-    const systemPrompt = `You are a helpful assistant. Answer the user's question using ONLY the provided context below. If the answer is not in the context, say "I don't know based on the provided documents."
+    // UPGRADE 2: Force the LLM to cite its sources
+    const systemPrompt = `You are a helpful technical assistant. Answer the user's question using ONLY the provided context below. 
+If the answer is not in the context, say "I don't know based on the provided documents."
+When you use information from the context, cite the source in brackets, like [Source: filename, Chunk X].
 
 CONTEXT:
 ${context}`;
 
-    // 5. Set up SSE Headers
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    // 6. Stream from Ollama
-    // Note: If qwen3.5 uses a "thinking" mode by default, you can add `think: false` here to speed up standard RAG responses.
     const stream = await ollama.chat({
       model: 'gemma4:latest',
       messages: [
@@ -66,21 +73,17 @@ ${context}`;
       stream: true,
     });
 
-    // 7. Pipe tokens to the client
     for await (const chunk of stream) {
-      // Ollama sends chunks where message.content is the token
       if (chunk.message.content) {
         res.write(`data: ${JSON.stringify({ token: chunk.message.content })}\n\n`);
       }
     }
 
-    // 8. End the stream cleanly
     res.write('data: [DONE]\n\n');
     res.end();
 
   } catch (error: any) {
     console.error('Chat Error:', error);
-    // If headers are already sent, we can't send JSON, just end.
     if (res.headersSent) {
       res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
       res.end();
