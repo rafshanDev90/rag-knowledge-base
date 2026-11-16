@@ -1,20 +1,23 @@
 import chalk from 'chalk';
 import readline from 'readline';
+import crypto from 'crypto';
 
-// We use native Node.js fetch (available in Node 18+)
+// Generate ONE session ID for this entire CLI run
+const SESSION_ID = crypto.randomUUID();
+
 const askQuestion = async (query: string) => {
-  console.log(chalk.blue(`\n🤖 Thinking...`));
+  console.log(chalk.blue(`\n🤖 Thinking (Session: ${SESSION_ID.substring(0, 8)}...)...`));
   
   try {
     const response = await fetch('http://localhost:5000/api/documents/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
+      // Send the sessionId with every request!
+      body: JSON.stringify({ query, sessionId: SESSION_ID }),
     });
 
     if (!response.body) throw new Error('No response body');
 
-    // Read the stream
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     
@@ -25,7 +28,6 @@ const askQuestion = async (query: string) => {
       if (done) break;
 
       const chunk = decoder.decode(value);
-      // Split by SSE newlines
       const lines = chunk.split('\n\n');
 
       for (const line of lines) {
@@ -36,12 +38,17 @@ const askQuestion = async (query: string) => {
           try {
             const data = JSON.parse(dataStr);
             if (data.token) {
-              process.stdout.write(chalk.green(data.token));
+              // If it's an escalation, print it in yellow to stand out
+              if (data.type === 'escalation') {
+                process.stdout.write(chalk.yellow(data.token));
+              } else {
+                process.stdout.write(chalk.green(data.token));
+              }
             } else if (data.error) {
               console.log(chalk.red(`\nError: ${data.error}`));
             }
           } catch (e) {
-            // Ignore partial JSON parsing errors during streaming
+            // Ignore partial JSON
           }
         }
       }
@@ -52,15 +59,15 @@ const askQuestion = async (query: string) => {
   }
 };
 
-// Set up the interactive prompt
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
 });
 
 console.log(chalk.cyan.bold('========================================'));
-console.log(chalk.cyan.bold('   📚 RAG Document Assistant CLI '));
+console.log(chalk.cyan.bold('   📚 RAG Assistant CLI (Phase 2)       '));
 console.log(chalk.cyan.bold('========================================'));
+console.log(chalk.gray(`Session ID: ${SESSION_ID}`));
 console.log(chalk.gray('Type your question and press Enter. (Type "exit" to quit)'));
 
 const promptUser = () => {
@@ -71,7 +78,7 @@ const promptUser = () => {
     }
     
     await askQuestion(answer);
-    promptUser(); // Loop back for the next question
+    promptUser(); 
   });
 };
 
