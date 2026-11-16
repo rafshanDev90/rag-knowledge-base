@@ -1,24 +1,56 @@
-import { DocumentChunk, IDocumentChunk } from '../models/DocumentChunk.js';
-import { Ollama } from 'ollama';
+import { DocumentChunk } from '../models/DocumentChunk.js';
+import {
+  AutoTokenizer,
+  AutoModelForSequenceClassification,
+  type PreTrainedTokenizer,
+  type PreTrainedModel,
+} from '@huggingface/transformers';
 
-const ollama = new Ollama({ host: 'http://127.0.0.1:11434' });
+const RERANKER_MODEL = 'Xenova/bge-reranker-base';
+
+interface RerankerBundle {
+  tokenizer: PreTrainedTokenizer;
+  model: PreTrainedModel;
+}
+
+// Singleton promise to cache tokenizer + model cleanly
+let rerankerPromise: Promise<RerankerBundle> | null = null;
+
+const getReranker = async (): Promise<RerankerBundle> => {
+  if (!rerankerPromise) {
+    console.log(`📥 Loading local ONNX reranker (${RERANKER_MODEL})...`);
+    rerankerPromise = Promise.all([
+      AutoTokenizer.from_pretrained(RERANKER_MODEL),
+      AutoModelForSequenceClassification.from_pretrained(RERANKER_MODEL),
+    ]).then(([tokenizer, model]) => {
+      console.log('✅ Reranker loaded.');
+      return { tokenizer, model };
+    });
+  }
+  return rerankerPromise;
+};
 
 interface HybridSearchOptions {
   query: string;
   queryEmbedding: number[];
   tenantId: string;
-  limit?: number;        // Final number of chunks to return after reranking
-  candidates?: number;   // Number of candidates to fetch from each search path
+  limit?: number;
+  candidates?: number;
   rrf_k?: number;
   vectorWeight?: number;
   keywordWeight?: number;
 }
-interface RerankItem {
-  doc: any;
-  score: number;
+
+export interface SearchChunk {
+  _id: unknown;
+  text: string;
+  sourceFile: string;
+  chunkIndex: number;
 }
 
-export const hybridSearchWithReranking = async (options: HybridSearchOptions) => {
+export const hybridSearchWithReranking = async (
+  options: HybridSearchOptions
+): Promise<SearchChunk[]> => {
   const {
     query,
     queryEmbedding,
@@ -51,7 +83,6 @@ export const hybridSearchWithReranking = async (options: HybridSearchOptions) =>
       $search: {
         index: 'text_index',
         text: { query, path: 'text' },
-        // Optional: Add a filter for tenantId if your Atlas Search index supports it
       },
     },
     { $limit: candidates },
@@ -60,24 +91,24 @@ export const hybridSearchWithReranking = async (options: HybridSearchOptions) =>
 
   // Execute both searches in parallel
   const [vectorResults, keywordResults] = await Promise.all([
-    DocumentChunk.aggregate(vectorPipeline),
-    DocumentChunk.aggregate(keywordPipeline),
+    DocumentChunk.aggregate<SearchChunk>(vectorPipeline),
+    DocumentChunk.aggregate<SearchChunk>(keywordPipeline),
   ]);
 
   // --- MERGE WITH RRF ---
-  const rrfScores = new Map<string, { doc: any; score: number }>();
+  const rrfScores = new Map<string, { doc: SearchChunk; score: number }>();
 
-  // Helper to add RRF scores
-  const addToRrf = (results: any[], weight: number) => {
+  const addToRrf = (results: SearchChunk[], weight: number) => {
     results.forEach((doc, index) => {
       const rank = index + 1;
       const rrfScore = weight * (1 / (rrf_k + rank));
-      const existing = rrfScores.get(doc._id.toString());
-      
+      const docId = String(doc._id);
+      const existing = rrfScores.get(docId);
+
       if (existing) {
         existing.score += rrfScore;
       } else {
-        rrfScores.set(doc._id.toString(), { doc, score: rrfScore });
+        rrfScores.set(docId, { doc, score: rrfScore });
       }
     });
   };
@@ -85,46 +116,45 @@ export const hybridSearchWithReranking = async (options: HybridSearchOptions) =>
   addToRrf(vectorResults, vectorWeight);
   addToRrf(keywordResults, keywordWeight);
 
-  // Sort by fused RRF score and take the top candidates
-  const fusedResults = Array.from(rrfScores.values())
+  const fusedResults: SearchChunk[] = Array.from(rrfScores.values())
     .sort((a, b) => b.score - a.score)
     .slice(0, candidates)
     .map((item) => item.doc);
 
   if (fusedResults.length === 0) return [];
 
-  // --- RERANKING (Cross-Encoder via Ollama) ---
- try {
-  console.log(`🔄 Reranking ${fusedResults.length} candidates...`);
+  // --- RERANKING (Local ONNX Cross-Encoder) ---
+  try {
+    console.log(`🔄 Reranking ${fusedResults.length} candidates with local ONNX...`);
+    const { tokenizer, model } = await getReranker();
 
-  const scoredResults: RerankItem[] = await Promise.all(
-    fusedResults.map(async (doc) => {
-      const prompt = `Rate how relevant the following passage is to answering the query on a scale of 0 to 10. Respond ONLY with JSON: {"score": number}.
+    // Pair the query with each candidate document text
+    const queries = fusedResults.map(() => query);
+    const texts = fusedResults.map((chunk) => chunk.text);
 
-Query: ${query}
-Passage: ${doc.text}`;
+    const inputs = tokenizer(queries, {
+      text_pair: texts,
+      padding: true,
+      truncation: true,
+    });
 
-      const response = await ollama.chat({
-        model: 'qllama/bge-reranker-v2-m3:latest', // Use whatever fast chat model you already pulled
-        messages: [{ role: 'user', content: prompt }],
-        format: 'json',
-        options: { temperature: 0 },
-      });
+    const { logits } = await model(inputs);
+    const scores = Array.from(logits.data as Float32Array);
 
-      const parsed = JSON.parse(response.message.content) as { score?: number };
-      return {
+    // Pair each chunk with its sigmoid-normalized relevance score (0 to 1)
+    const scoredResults = fusedResults
+      .map((doc, idx) => ({
         doc,
-        score: typeof parsed.score === 'number' ? parsed.score : 0,
-      };
-    })
-  );
+        score: 1 / (1 + Math.exp(-scores[idx])),
+      }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map((item) => item.doc);
 
-  return scoredResults
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-    .map((item) => item.doc);
-} catch (error) {
-  console.warn('⚠️ Reranking failed, falling back to RRF order:', error);
-  return fusedResults.slice(0, limit);
-}
+    console.log('✅ ONNX Reranking complete.');
+    return scoredResults;
+  } catch (error) {
+    console.warn('⚠️ ONNX reranking failed, falling back to RRF order:', error);
+    return fusedResults.slice(0, limit);
+  }
 };

@@ -1,4 +1,5 @@
 import { Ollama } from 'ollama';
+import { generateJSON } from '../services/llmService.js'; // NEW IMPORT
 
 const ollama = new Ollama({ host: 'http://127.0.0.1:11434' });
 
@@ -15,17 +16,9 @@ export const classifyIntent = async (query: string): Promise<{ intent: Intent; r
   {"intent": "DOCUMENT_QA" | "HIGH_RISK" | "CHITCHAT", "reason": "A short explanation"}`;
 
   try {
-    const response = await ollama.chat({
-      model: 'gemma4:latest',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: query }
-      ],
-      stream: false,
-      format: 'json', // Senior Trick: Forces Ollama to output valid JSON
-    });
+    const response = await generateJSON(systemPrompt, query);
 
-    const result = JSON.parse(response.message.content);
+    const result = JSON.parse(response);
     return {
       intent: result.intent as Intent,
       reason: result.reason,

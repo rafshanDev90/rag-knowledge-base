@@ -1,5 +1,7 @@
 import { ChatSession, IChatSession } from '../models/ChatSession.js';
 import { ChatMessage, IChatMessage } from '../models/ChatMessage.js';
+
+import { generateText } from './llmService.js'; // NEW: Use abstraction layer
 import { getEncoding } from 'js-tiktoken';
 import { Ollama } from 'ollama';
 
@@ -70,13 +72,10 @@ export const compactHistory = async (session: IChatSession) => {
 
     const textToSummarize = oldMessages.map(m => `${m.role}: ${m.content}`).join('\n');
     
-    const response = await ollama.generate({
-      model: 'gemma4:latest',
-      prompt: `Summarize the following conversation concisely, preserving key facts and user intent:\n\n${textToSummarize}`,
-      stream: false,
-    });
+    const prompt = `Summarize the following conversation concisely, preserving key facts and user intent:\n\n${textToSummarize}`;
+    const summaryText = await generateText(prompt);
 
-    const newSummary = `${session.runningSummary}\n${response.response}`.trim();
+    const newSummary = `${session.runningSummary}\n${summaryText}`.trim();
     
     // Update session with new summary
     await ChatSession.updateOne(

@@ -6,6 +6,7 @@ import { generateEmbeddings } from '../services/embeddingService.js';
 import { Escalation } from '../models/Escalation.js'; // NEW IMPORT
 import { classifyIntent } from '../services/routerService.js'; // NEW IMPORT
 import { hybridSearchWithReranking } from '../services/hybridSearchService.js';
+import { streamChat} from '../services/llmService.js';
 
 
 import { getOrCreateSession, getContextForLLM, saveMessage, compactHistory } from '../services/sessionService.js';
@@ -124,12 +125,7 @@ ${context}`;
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    const stream = await ollama.chat({
-      model: 'gemma4:latest',
-      messages: messages,
-      stream: true,
-      keep_alive: '30m', // Keep model loaded for session continuity
-    });
+    const stream = await streamChat(messages);
 
     let fullResponse = '';
 
