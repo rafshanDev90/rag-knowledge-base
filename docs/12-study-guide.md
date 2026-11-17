@@ -36,7 +36,7 @@ This file is for revision. Read it after the phase files.
 | **TTFT** | Time To First Token: the latency the user actually perceives. |
 | **SSE** | Server-Sent Events: a one-way streaming HTTP response. |
 | **Hallucination** | A fluent answer not supported by the context. |
-| **Citation** | A label like `[Source: file.pdf, Chunk 12]` pointing to evidence. |
+| **Citation** | A label like `[Source: file.pdf, Page 12, Chunk 4]` pointing to evidence. |
 | **Idempotency** | Repeating an operation has no additional effect. |
 | **`sourceHash`** | SHA-256 of the normalized full document. |
 | **`contentHash`** | SHA-256 of one chunk. |
@@ -193,8 +193,8 @@ The CLI switches from "Thinking…" to streaming on the first token, then prints
 8. **Why can two tenants collide on `chunkId`?**
    `chunkId = sourceHash_index` and the unique index is global, not tenant-scoped.
 
-9. **Why is the idempotency check unsafe?**
-   It returns true if any chunk exists, so a partial insert is treated as complete.
+9. **Why is the idempotency check still not fully safe?**
+   It compares counts instead of using `exists`, so partial ingests recover on re-upload, but concurrent uploads can still race because the check and the write are not atomic.
 
 10. **Why must query and document embeddings use the same model?**
     Different models produce different vector spaces; similarity becomes meaningless.

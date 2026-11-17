@@ -1,6 +1,9 @@
+import '../config/env.js';
 import {Ollama} from "ollama";
 
-const ollama = new Ollama({ host: 'http://127.0.0.1:11434' });
+const ollama = new Ollama({
+  host: process.env.OLLAMA_HOST || 'http://127.0.0.1:11434',
+});
 
 export const MODELS = {
   CHAT: process.env.CHAT_MODEL || 'gemma4:latest',      // Or 'qwen3.5:4b'

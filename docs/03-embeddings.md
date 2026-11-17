@@ -44,22 +44,38 @@ Embeddings let you search millions of chunks quickly. A cross-encoder is more ac
 ## 2. The embedding service
 
 ```ts
-const ollama = new Ollama({ host: 'http://127.0.0.1:11434' });
+const ollama = new Ollama({
+  host: process.env.OLLAMA_HOST || 'http://127.0.0.1:11434',
+});
 
 const response = await ollama.embed({
-  model: 'nomic-embed-text',
-  input: texts,          // string[]
+  model: process.env.EMBED_MODEL || 'nomic-embed-text',
+  input: texts,                       // string[]
+  keep_alive: process.env.OLLAMA_KEEP_ALIVE || '30m',
 });
-return response.embeddings; // number[][]
 ```
 
 Key properties:
 
-- **Batch API.** `input` can be one string or many. Ingestion passes the whole chunk array at once; query passes `[query]`.
+- **Configurable host and model.** `OLLAMA_HOST` and `EMBED_MODEL` come from the environment, so the service is no longer tied to `127.0.0.1` or one model name.
+- **Batch API.** `input` can be one string or many. Ingestion passes batches; query passes `[query]`.
 - **Same model for both sides.** Query and document vectors must live in the same vector space. Changing the model invalidates the entire index.
-- **No `keep_alive`.** Unlike `streamChat`, the embed call does not ask Ollama to keep the model resident. It uses the server default (5 minutes in the current setup), so the embed model can be unloaded between requests and reloaded on the next one.
-- **No timeout, retry, or abort.** A closed socket becomes an immediate hard failure.
-- **Error swallowing.** The `catch` logs the original error and throws a generic `Error('Failed to generate embeddings via Ollama')`, losing the cause for callers.
+- **`keep_alive`.** The embed call now pins the model for 30 minutes instead of letting the server unload it after the default 5. This removes the most common cold-load latency and reduces the load/unload churn that triggered OOM kills.
+- **Retries with backoff.** Up to 3 attempts. Socket-level failures are retried; "model not found" and validation errors are not.
+- **Count validation.** `response.embeddings.length` must equal `texts.length`, otherwise the call throws.
+- **Error cause preserved.** The thrown error includes the original failure text instead of a generic message.
+
+### Retry classification
+
+```ts
+const retryableCodes = ['UND_ERR_SOCKET', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE'];
+```
+
+Plus a message check for `fetch failed`, `socket`, `terminated`, `loading model`, and `connection`.
+
+This is deliberately narrow. Retrying a 404 or a malformed request just wastes time. Retrying a closed socket is exactly what you want after Ollama restarts a runner.
+
+What retries do **not** do: create memory. If the host is out of RAM, three retries will all fail. See `11-runtime-ollama-performance.md`.
 
 ---
 
@@ -100,16 +116,13 @@ Practical compromise for an existing index: add prefixes at query time only and 
 
 ### Ingestion
 
-`chunkingService.processAndSaveChunks`:
+`chunkingService.processAndSaveChunks` calls `embedInBatches`, which splits chunk text into batches of `EMBED_BATCH_SIZE` (default 32) and awaits them one at a time:
 
-```ts
-const embeddings = await generateEmbeddings(textChunks);
-```
-
-- One request for the entire document.
-- `textChunks.length` can be hundreds.
-- `embeddings[index]` is attached to each chunk without checking length or order.
-- The embedding call happens **before** `insertMany`, so a crash discards all embedding work.
+- A 42-chunk document becomes two requests (`1–32`, `33–42`).
+- The model is pinned with `keep_alive`, so the second batch does not reload it.
+- The final count check catches a batch that returned the wrong number of vectors.
+- Embedding still happens **before** `insertMany`, so a crash discards all work. There is no resume.
+- Batches are sequential, not concurrent. Concurrency would help throughput but increases peak memory on this machine, so sequential is the safer default here.
 
 ### Query
 
@@ -182,26 +195,36 @@ If the index says 768 and you insert 1024, inserts may succeed but search fails 
 
 | Failure | Symptom |
 |---|---|
-| Ollama down | `fetch failed` / `ECONNREFUSED` |
-| Model not pulled | Ollama 404 "model not found" |
+| Ollama down | `fetch failed` / `ECONNREFUSED` (retried, then surfaced) |
+| Model not pulled | Ollama 404 "model not found" (not retried) |
 | Model unloaded + host pressure | Socket closed mid-load (the crash above) |
-| Huge ingestion batch | Long request, memory spike, timeout |
+| Large ingestion | More batches, so more wall-clock time, but smaller requests |
 | Wrong dimension | Vector index error or empty results |
 | Different model for query vs docs | Results look random; similarity is meaningless |
 | Missing task prefixes | Weaker recall, especially on short queries |
+| Bad `EMBED_BATCH_SIZE` | Too large → memory spikes; too small → request overhead |
 
 ---
 
-## 8. What to improve
+## 8. What is handled vs what remains
 
-1. Add `keep_alive` to embed calls so the model stays resident.
-2. Batch ingestion (32–64 chunks) with bounded concurrency.
-3. Retry transient errors with exponential backoff + jitter.
-4. Add a timeout and an `AbortController`.
-5. Validate `embeddings.length === texts.length` and each vector's dimension.
-6. Preserve the original error cause when re-throwing.
-7. Add the `search_query:` / `search_document:` prefixes (with re-ingestion).
-8. Centralize the Ollama host and model name in config.
+Handled in the current code:
+
+- `keep_alive` on embed calls.
+- Batching at ingestion.
+- Retry with exponential backoff + jitter for transient failures.
+- `embeddings.length` validation.
+- Original error cause preserved.
+- Configurable Ollama host and embedding model.
+
+Still missing:
+
+1. A per-request **timeout** and `AbortController`.
+2. Per-vector dimension validation (768 for nomic).
+3. Nomic task prefixes (`search_query:` / `search_document:`), which require re-ingestion on the document side.
+4. Bounded concurrency instead of sequential batches.
+5. Streaming/resumable ingestion, so a crash does not lose completed batches.
+6. Embedding cache keyed by `contentHash`, so unchanged chunks are never re-embedded.
 
 ---
 
@@ -212,8 +235,10 @@ If the index says 768 and you insert 1024, inserts may succeed but search fails 
 3. What is the difference between a bi-encoder and a cross-encoder, and why use both?
 4. What exactly happens if you change the embedding model without re-indexing?
 5. Why is the embedding call the most likely place to see an Ollama socket error?
-6. Why does batching all chunks into one request increase risk?
+6. Why does batching all chunks into one request increase risk, and what does batching in groups of 32 change?
 7. What do the `search_query:` and `search_document:` prefixes do?
 8. Where is `select: false` set, and why does it not break vector search?
 9. How would you detect that stored vectors and query vectors are misaligned?
 10. What is the cheapest way to reduce embedding cost at ingestion?
+11. Why does `keep_alive` reduce both latency and OOM risk?
+12. Why should a "model not found" error not be retried?

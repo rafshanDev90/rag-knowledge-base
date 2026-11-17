@@ -34,7 +34,7 @@ Vector search answers **"what does this mean?"**. BM25 answers **"where does thi
     filter: { tenantId },
   },
 },
-{ $project: { _id: 1, text: 1, sourceFile: 1, chunkIndex: 1 } }
+{ $project: { _id: 1, text: 1, sourceFile: 1, chunkIndex: 1, page: 1 } }
 ```
 
 - `numCandidates: 100` — Atlas examines 100 approximate nearest neighbours, then keeps the top `limit`.
@@ -53,7 +53,7 @@ Vector search answers **"what does this mean?"**. BM25 answers **"where does thi
   },
 },
 { $limit: candidates },
-{ $project: { _id: 1, text: 1, sourceFile: 1, chunkIndex: 1 } }
+{ $project: { _id: 1, text: 1, sourceFile: 1, chunkIndex: 1, page: 1 } }
 ```
 
 - `$search` must also appear first.

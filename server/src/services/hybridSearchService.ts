@@ -46,6 +46,7 @@ export interface SearchChunk {
   text: string;
   sourceFile: string;
   chunkIndex: number;
+  page?: number;
 }
 
 export const hybridSearchWithReranking = async (
@@ -74,7 +75,7 @@ export const hybridSearchWithReranking = async (
         filter: { tenantId },
       },
     },
-    { $project: { _id: 1, text: 1, sourceFile: 1, chunkIndex: 1 } },
+    { $project: { _id: 1, text: 1, sourceFile: 1, chunkIndex: 1, page: 1 } },
   ];
 
   // --- PATH 2: Atlas Search (BM25 Keyword) ---
@@ -86,7 +87,7 @@ export const hybridSearchWithReranking = async (
       },
     },
     { $limit: candidates },
-    { $project: { _id: 1, text: 1, sourceFile: 1, chunkIndex: 1 } },
+    { $project: { _id: 1, text: 1, sourceFile: 1, chunkIndex: 1, page: 1 } },
   ];
 
   // Execute both searches in parallel

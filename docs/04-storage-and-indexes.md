@@ -43,7 +43,7 @@ The database is **MongoDB Atlas**, not local MongoDB. Two Atlas-specific search 
 | `text` | string | Retrievable content |
 | `tokenCount` | number | `cl100k_base` approximation |
 | `blockType` | enum | `prose`, `equation`, `table`, `code` |
-| `page?` | number | Optional, not populated today |
+| `page?` | number | Populated from the PDF page map when extractable |
 | `section?` | string | Optional, not populated today |
 | `tenantId` | string | Isolation key |
 | `ingestedAt` | date | Freshness |

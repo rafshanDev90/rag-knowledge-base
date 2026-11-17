@@ -1,7 +1,6 @@
 import { Request, Response } from 'express';
 import crypto from 'crypto'; // NEW: Native crypto for UUID generation
 
-import { DocumentChunk } from '../models/DocumentChunk.js';
 import { generateEmbeddings } from '../services/embeddingService.js';
 import { Escalation } from '../models/Escalation.js'; // NEW IMPORT
 import { classifyIntent } from '../services/routerService.js'; // NEW IMPORT
@@ -10,9 +9,6 @@ import { streamChat} from '../services/llmService.js';
 
 
 import { getOrCreateSession, getContextForLLM, saveMessage, compactHistory } from '../services/sessionService.js';
-import { Ollama } from 'ollama';
-
-const ollama = new Ollama({ host: 'http://127.0.0.1:11434' });
 
 export const chatWithDocument = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -104,13 +100,16 @@ export const chatWithDocument = async (req: Request, res: Response): Promise<voi
     }
 
     const context = validResults
-      .map((r: any) => `[Source: ${r.sourceFile}, Chunk ${r.chunkIndex}]\n${r.text}`)
+      .map((r: any) => {
+        const pageLabel = r.page ? `, Page ${r.page}` : '';
+        return `[Source: ${r.sourceFile}${pageLabel}, Chunk ${r.chunkIndex}]\n${r.text}`;
+      })
       .join('\n\n');
 
     // UPGRADE 2: Force the LLM to cite its sources
     const systemPrompt = `You are a helpful technical assistant. Answer the user's question using ONLY the provided context below. 
 If the answer is not in the context, say "I don't know based on the provided documents."
-When you use information from the context, cite the source in brackets, like [Source: filename, Chunk X].
+When you use information from the context, cite the source in brackets, like [Source: filename, Page X, Chunk Y]. Omit the page if the context does not include one.
 
 CONTEXT:
 ${context}`;

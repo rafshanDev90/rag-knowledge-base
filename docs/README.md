@@ -27,13 +27,14 @@ RAG has two completely separate lifecycles. Keep them separate in your head.
 
 ```
 PDF bytes
-  → pdf-parse (text extraction)
-  → normalizeText (collapse whitespace)
+  → pdf-parse (whole text + per-page text)
+  → page-aware normalize (collapse whitespace, keep page ranges)
   → SHA-256 sourceHash
-  → idempotency check in MongoDB
   → RecursiveCharacterTextSplitter (1000 chars / 200 overlap)
-  → per-chunk metadata + contentHash + tokenCount
-  → Ollama /api/embed (nomic-embed-text, 768 dims)
+  → count existing chunks (skip if complete)
+  → per-chunk metadata + page + contentHash + tokenCount
+  → Ollama /api/embed in batches of 32 (nomic-embed-text, 768 dims, keep_alive)
+  → replace partial ingestion if needed
   → insertMany into Atlas
 ```
 
@@ -94,8 +95,8 @@ The 38 s you saw was dominated by **cold model loads and model thrashing**, not 
 | `server/src/app.ts` | Middleware, `/health`, mount routes |
 | `server/src/config/env.ts` | `dotenv` + `{ port, mongoUri, openAiApiKey }` |
 | `server/src/config/db.ts` | Mongoose connection, `strictQuery` |
-| `server/src/routes/documentRoutes.ts` | Multer config + 3 routes |
-| `server/src/controllers/documentController.ts` | Upload → extract → chunk |
+| `server/src/routes/documentRoutes.ts` | Multer config + 4 routes |
+| `server/src/controllers/documentController.ts` | Upload → extract (pages) → chunk; list modules |
 | `server/src/controllers/searchController.ts` | Debug vector search (no tenant filter) |
 | `server/src/controllers/chatController.ts` | Full RAG request orchestration |
 | `server/src/services/chunkingService.ts` | Normalize, hash, split, embed, insert |
@@ -124,7 +125,7 @@ DocumentChunk
   tokenCount    cl100k_base token count (approximate)
   embedding     768-float array, select:false
   tenantId      multi-tenancy key
-  sourceFile, blockType, page?, section?, ingestedAt
+  sourceFile, blockType, page (populated), section?, ingestedAt
 
 ChatSession
   sessionId (UUID), tenantId, userId
@@ -182,12 +183,15 @@ Each is explained in its own file.
 - Normalization removes newlines, so the splitter's `\n\n` / `\n` separators never fire.
 - `chunkSize` is **characters**, not tokens; `tokenCount` uses an OpenAI tokenizer, not the model's.
 - `chunkId` is globally unique but does **not** include `tenantId` → identical documents across tenants collide.
-- The idempotency check is non-atomic and treats *any* existing chunk as "fully ingested".
+- Idempotency now compares counts, but it is still non-atomic: concurrent uploads of the same file can race.
+- Ingestion re-embeds the whole document when chunk parameters change or a partial ingest is repaired.
+- Documents ingested before page mapping produce a different `sourceHash` and appear as duplicates until cleaned up.
+- Embedding batches run sequentially; large documents are still slow.
 - The BM25 path has **no tenant filter**; `/search` has no tenant filter at all.
 - The reranker model is hardcoded and does not match `RERANK_MODEL` in `.env`; a rejected load is cached forever.
 - The router is a blocking 8B LLM call before retrieval.
 - `compactHistory` scans the whole session every turn and can summarize recent messages.
-- No timeouts, retries, cancellation, or per-stage metrics anywhere.
+- No request timeouts, abort support, or per-stage metrics anywhere (embeddings do retry).
 - Ollama runs inside a WSL2 VM capped at 7.6 GB, causing OOM during embedding loads.
 - `js-tiktoken` is imported but not declared in `package.json`.
 - `npm run build` fails on dependency type errors (`skipLibCheck` not set); the app runs via `tsx`.
@@ -202,6 +206,20 @@ npm run dev     # tsx src/server.ts, port 5000
 npm run cli     # interactive terminal client
 ```
 
+Typical study loop:
+
+```
+npm run cli
+❯ /upload ../doc/ch3.pdf     # ingest a class module
+❯ /modules                   # confirm it is in the library
+❯ Explain the AX register    # ask a grounded question
+❯ /new                       # start a clean conversation
+```
+
+CLI commands: `/upload [path]`, `/modules` (`/docs`), `/new`, `/clear`, `/help`, `exit`.
+
+Optional CLI environment overrides: `API_BASE`, `TENANT_ID`.
+
 Prerequisites:
 
 - Ollama on `127.0.0.1:11434` with `nomic-embed-text`, the chat/router/summary models, and the reranker files.
@@ -209,6 +227,7 @@ Prerequisites:
   - a vector index named `vector_index` on `embedding` (768 dims, cosine, `tenantId` as filter),
   - a Search index named `text_index` on `text`.
 - `.env` with `MONGO_URI`, `CHAT_MODEL`, `ROUTER_MODEL`, `SUMMARY_MODEL`, `RERANK_MODEL`.
+- Optional: `OLLAMA_HOST`, `EMBED_MODEL`, `OLLAMA_KEEP_ALIVE`, `EMBED_BATCH_SIZE`.
 
 Those Atlas indexes are **not** created by the code. If they are missing or have the wrong dimension, retrieval silently fails or errors.
 

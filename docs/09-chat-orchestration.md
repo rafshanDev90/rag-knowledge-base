@@ -142,16 +142,19 @@ This is the grounded "I don't know" path. It is the correct behavior when retrie
 
 ```ts
 const context = validResults
-  .map((r) => `[Source: ${r.sourceFile}, Chunk ${r.chunkIndex}]\n${r.text}`)
+  .map((r) => {
+    const pageLabel = r.page ? `, Page ${r.page}` : '';
+    return `[Source: ${r.sourceFile}${pageLabel}, Chunk ${r.chunkIndex}]\n${r.text}`;
+  })
   .join('\n\n');
 ```
 
-Each chunk is prefixed with a machine-readable citation label. The labels are what the model is instructed to reproduce.
+Each chunk is prefixed with a machine-readable citation label. The labels are what the model is instructed to reproduce. Page is optional: documents ingested before page mapping was added have no `page` field, so the label degrades to `[Source: file.pdf, Chunk 12]`.
 
 Why this format:
 
 - It gives the model an unambiguous token to copy.
-- It keeps the source and chunk index adjacent to the text.
+- It keeps the source, page, and chunk index adjacent to the text.
 - It is easy to parse later if you want to render citations in a UI.
 
 Limitation: the model can still cite the wrong chunk or invent a label. Citations are **not verified** against the retrieved set after generation. A robust system would parse the answer, check each cited label against `validResults`, and flag invalid ones.
@@ -163,7 +166,7 @@ Limitation: the model can still cite the wrong chunk or invent a label. Citation
 ```ts
 const systemPrompt = `You are a helpful technical assistant. Answer the user's question using ONLY the provided context below.
 If the answer is not in the context, say "I don't know based on the provided documents."
-When you use information from the context, cite the source in brackets, like [Source: filename, Chunk X].
+When you use information from the context, cite the source in brackets, like [Source: filename, Page X, Chunk Y]. Omit the page if the context does not include one.
 
 CONTEXT:
 ${context}`;

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { uploadDocument } from '../controllers/documentController.js';
+import { listDocuments, uploadDocument } from '../controllers/documentController.js';
 import { searchDocument } from '../controllers/searchController.js'; // NEW IMPORT
 import { chatWithDocument } from '../controllers/chatController.js'; // NEW IMPORT
 
@@ -22,6 +22,9 @@ const upload = multer({
     }
   },
 });
+
+// Route: GET /api/documents?tenantId=... — list ingested modules
+router.get('/', listDocuments);
 
 // Route: POST /api/documents/upload
 router.post('/upload', upload.single('document'), uploadDocument);

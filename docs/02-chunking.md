@@ -24,14 +24,15 @@ A good chunk is **self-contained enough to answer a question** and **small enoug
 `processAndSaveChunks(rawText, fileName, options)`:
 
 1. Validate: non-empty text, `overlap < chunkSize`, `tenantId` present.
-2. `normalizeText(rawText)`.
+2. Build the normalized source: `normalizeText(rawText)`, or a page-by-page join when `options.pages` is provided. The join also records character ranges per page.
 3. `sourceHash = SHA-256(normalized)`.
-4. Idempotency check: `DocumentChunk.exists({ sourceHash, tenantId })`.
-5. Build a `RecursiveCharacterTextSplitter`.
-6. `splitter.createDocuments([normalized])`.
-7. For each chunk: `contentHash`, `tokenCount`, index, metadata.
-8. Embed **all** chunk texts in one Ollama call.
-9. `insertMany(chunkDocs, { ordered: false })`.
+4. Build a `RecursiveCharacterTextSplitter`.
+5. `splitter.createDocuments([normalized])`.
+6. Count existing chunks: `DocumentChunk.countDocuments({ sourceHash, tenantId })`. If it equals `totalChunks`, return `{ skipped: true }` without embedding.
+7. For each chunk: locate its starting page, then compute `contentHash`, `tokenCount`, index, metadata.
+8. Embed chunk texts in **batches** of `EMBED_BATCH_SIZE` (default 32), with retries.
+9. If a partial previous ingestion exists, `deleteMany({ sourceHash, tenantId })`.
+10. `insertMany(chunkDocs, { ordered: false })`.
 
 ---
 
@@ -55,6 +56,28 @@ What it breaks:
 - Section headings are no longer distinguishable from body text.
 
 This is a real design coupling: **normalization and splitting must be designed together.** If you want structure-aware chunks, normalize less aggressively (e.g., collapse spaces/tabs but preserve `\n\n`).
+
+### Page-aware normalization
+
+When the controller passes `pages[]`, the chunker does not normalize `rawText` directly. It normalizes each page, joins them with a single space, and stores character ranges:
+
+```
+page 1 text [0, 1432)
+page 2 text [1433, 2901)
+page 3 text [2902, 4510)
+...
+```
+
+After splitting, each chunk is located back into this string with `indexOf`, starting from the previous chunk's position. The page whose range contains the chunk's start becomes `chunk.page`.
+
+Two details:
+
+- Searching from the previous position keeps the mapping monotonic even when text repeats.
+- The splitter may trim whitespace at chunk edges, so the locator falls back to a 40-character prefix probe.
+
+This is O(n) over the document and adds no model cost. It is the cheapest useful metadata you can attach to a chunk.
+
+**Consequence:** `sourceHash` now hashes the *page-joined* normalized text. A document ingested before this change has a different hash than the same document ingested now. That is why re-uploading an old module created a second copy instead of replacing the first during testing. Fresh environments do not have this problem; existing ones need a one-time cleanup.
 
 ---
 
@@ -144,7 +167,7 @@ Exact boundaries depend on where the sentence separators fall, because the split
 | `text` | splitter output | The retrievable content |
 | `tokenCount` | `cl100k_base` | Budgeting |
 | `blockType` | default `prose` | Future structure-aware retrieval |
-| `page`, `section` | optional | Future page-aware citation |
+| `page`, `section` | page map / caller | `page` is now populated; `section` is still unused |
 | `tenantId` | caller | Isolation |
 | `ingestedAt` | now | Freshness / debugging |
 
@@ -152,19 +175,31 @@ Exact boundaries depend on where the sentence separators fall, because the split
 
 ## 7. Embedding inside the chunking service
 
-After splitting, the code calls:
+After splitting, the code calls `embedInBatches(textChunks)`:
 
 ```ts
-const embeddings = await generateEmbeddings(textChunks);
+for (let start = 0; start < texts.length; start += EMBED_BATCH_SIZE) {
+  const batch = texts.slice(start, start + EMBED_BATCH_SIZE);
+  const batchEmbeddings = await generateEmbeddings(batch);
+  embeddings.push(...batchEmbeddings);
+}
 ```
 
-All chunks go in **one** `/api/embed` request. This couples two concerns:
+`EMBED_BATCH_SIZE` defaults to **32** and is overridable with the `EMBED_BATCH_SIZE` env var.
 
-- A large PDF creates a very large request → long latency, high memory, higher chance of Ollama crashing or closing the socket.
-- If one chunk fails, the whole ingestion fails; there is no partial progress.
-- `embeddings[index]` assumes the response order and length exactly match the input. That is not validated.
+Why batch:
 
-A robust version batches (e.g., 32–64 chunks), limits concurrency, retries transient failures, and only inserts after all embeddings for a batch succeed.
+- A 42-chunk document is four requests instead of one large one. Each request is shorter and less likely to hit a timeout.
+- Progress is logged per batch, which makes a slow ingest diagnosable.
+- If a batch fails permanently, you fail fast instead of waiting on one giant call.
+
+Why batching alone is not enough:
+
+- Batches run **sequentially**. There is no bounded-concurrency pool, so a 500-chunk document is still slow.
+- Embeddings happen **before** any insert. A crash discards all embedding work, including completed batches.
+- The final `embeddings.length !== texts.length` check catches a missing batch, but not per-vector dimension changes.
+
+The retry, `keep_alive`, and error-cause handling live in `embeddingService.ts`; see `03-embeddings.md`.
 
 ---
 
@@ -186,17 +221,37 @@ The `catch` block recognizes duplicate-key / bulk-write errors and returns a par
 
 This is a best-effort report, not a transaction. Some chunks may be stored while others are not.
 
-### The idempotency trap
+### Idempotency and partial re-ingestion
+
+The check now runs **after splitting**, because the splitter output is what tells you how many chunks to expect:
 
 ```ts
-const existing = await DocumentChunk.exists({ sourceHash, tenantId });
-if (existing) {
-  const count = await DocumentChunk.countDocuments(...);
-  return { insertedCount: 0, duplicateCount: count, ... };
+const existingCount = await DocumentChunk.countDocuments({ sourceHash, tenantId });
+if (existingCount === totalChunks) {
+  return { insertedCount: 0, duplicateCount: existingCount, skipped: true, ... };
 }
 ```
 
-`exists` returns true if **even one** chunk exists. If a previous ingestion crashed after inserting 5 of 42 chunks, re-uploading the same file will be treated as "already done" and the missing 37 chunks will never be inserted. The check should count against `totalChunks`, or ingestion should be transactional/resumable.
+This fixes the old `exists()` trap. `exists` returned true if **even one** chunk existed, so a crash after 5 of 42 inserts made the document permanently incomplete.
+
+For a partial ingest (`0 < existingCount < totalChunks`), the flow is:
+
+1. Recompute all chunks and embeddings.
+2. `deleteMany({ sourceHash, tenantId })` **after** embeddings succeed.
+3. Insert the complete set.
+
+That makes recovery possible: re-upload the same file and the missing chunks are restored.
+
+The ordering matters. Deleting first would destroy the only copy if embedding then failed. Deleting after embedding means the worst case is "old partial data still there", which a later retry can fix.
+
+### What is still unsafe
+
+- **Not atomic.** Two concurrent uploads of the same file can both see `existingCount === 0`, both embed, both delete, and both insert. `ordered: false` reports duplicates, but the outcome is not deterministic.
+- **Count equality is a heuristic.** Different chunking parameters produce different `totalChunks`, so the same document uploaded with `chunkSize: 500` is treated as a new version even though it is the same content.
+- **Changing chunk parameters triggers a full re-embed.** `sourceHash` is unchanged (it hashes the text, not the chunking config), but `totalChunks` differs, so the code deletes and re-inserts every chunk.
+- **A page-aware re-extraction changes the hash.** Documents ingested before page mapping was added do not match their new counterpart, producing a duplicate in the library. `GET /api/documents` makes this visible; deleting the stale `sourceHash` is a manual cleanup.
+
+A fully robust version would use a `contentHash` on the document plus a version field, and wrap the delete+insert in a transaction or a per-`sourceHash` lock.
 
 ---
 
@@ -207,11 +262,11 @@ if (existing) {
 | Whitespace normalization | Newline separators never fire; structure lost |
 | Character-based size | Token counts vary widely per chunk |
 | Globally unique `chunkId` | Cross-tenant collisions |
-| Non-atomic `exists` check | Concurrent uploads race |
-| Partial insert | Re-upload skipped by idempotency |
-| One huge embed call | Slow / crash-prone ingestion |
-| `embeddings[index]` unchecked | Silent misalignment if API returns fewer vectors |
-| No transaction | Partial documents in the knowledge base |
+| Count-based idempotency | Concurrent uploads still race; not atomic |
+| Sequential embedding batches | Large documents remain slow |
+| `embeddings.length` check | Catches missing batches, not dimension drift |
+| Delete-then-insert | Not transactional; a crash mid-insert leaves a partial set (recoverable by re-upload) |
+| Page-join hash change | Pre-existing documents appear as duplicates until cleaned up |
 
 ---
 
@@ -223,7 +278,9 @@ if (existing) {
 4. Why is `tokenCount` approximate for nomic/gemma?
 5. What is the difference between `sourceHash`, `contentHash`, and `chunkId`?
 6. Why can two tenants uploading the same PDF collide?
-7. Walk through what happens if the process crashes after 5 of 42 inserts.
+7. Walk through what happens if the process crashes after 5 of 42 inserts, before and after the count-based check.
 8. Why is overlap useful, and what does it cost?
-9. How would you make ingestion resumable and idempotent?
-10. What would change if you wanted page-level citations?
+9. How would you make ingestion resumable and atomic?
+10. What would change if you wanted page-level citations? (Implemented: explain the page-range mapping.)
+11. Why does the page-aware join change `sourceHash` for existing documents?
+12. Why is `deleteMany` placed after embedding rather than before?
